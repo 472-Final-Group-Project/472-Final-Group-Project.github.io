@@ -39,7 +39,7 @@
 <script>
   const TOKEN        = 'pk.eyJ1IjoibG90dXM4MyIsImEiOiJjbXdma21laGIwMnI1MnlxNHV6Z2VrZ2tmIn0.XZXZ3usSt_BH1oHlTg1Jzg';
   const TITLE        = 'Data centers by power source';
-  const GEOJSON_FILE = 'aterio_ghosts_plants.geojson';   // same folder as this html file
+  const GEOJSON_FILE = 'aterio_ghosts.geojson';   // same folder as this html file
   const FLAG_FIELD   = 'flagMap';             // field that holds BTM / zombieFUEL / ghostFUEL / FUEL
 
   // One color per fuel, used by all symbols. Fuels not listed here get a fallback color automatically.
@@ -62,8 +62,8 @@
   // category -> shape and label
   const CATS = {
     active: { shape: 'circle',   label: 'Fuel (circle)' },
-    zombie: { shape: 'triangle', label: 'Zombie + fuel (triangle)' },
-    ghost:  { shape: 'diamond',  label: 'Ghost + fuel (diamond)' },
+    zombie: { shape: 'triangle', label: 'News + fuel (triangle)' },
+    ghost:  { shape: 'diamond',  label: 'EIA + fuel (diamond)' },
     btm:    { shape: 'star',     label: 'BTM (red star)' }
   };
 
