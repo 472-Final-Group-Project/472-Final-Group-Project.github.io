@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Data center cartogram</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<link href="https://api.mapbox.com/mapbox-gl-js/v3.7.0/mapbox-gl.css" rel="stylesheet">
+
+<script src="https://api.mapbox.com/mapbox-gl-js/v3.7.0/mapbox-gl.js"></script>
+
+<script src="https://cdn.jsdelivr.net/npm/@turf/turf@7.1.0/turf.min.js"></script>
+
+<style>
+  html, body { margin: 0; height: 100%; font-family: system-ui, sans-serif; }
+
+  #map { position: absolute; inset: 0; }
+
+  #panel, #legend {
+    position: absolute; background: #fff; padding: 10px 12px; border-radius: 6px;
+    box-shadow: 0 1px 4px rgba(0,0,0,.3); font-size: 12px; line-height: 1.6;
+  }
+
+  #panel { top: 12px; left: 12px; max-width: 260px; }
+
+  #title { font-size: 16px; font-weight: 600; margin-bottom: 4px; }
+
+  #status { color: #666; }
+
+  #legend { bottom: 24px; right: 12px; }
+
+  #legend i { display: inline-block; width: 14px; height: 14px; margin-right: 6px; vertical-align: middle; }
+
+  .mapboxgl-popup-content { font-size: 12px; line-height: 1.5; }
+  .mapboxgl-popup-content h4 { margin: 0 0 4px; font-size: 14px; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+
+<div id="panel">
+  <div id="title"></div>
+  <div id="status">Loading…</div>
+</div>
+
+<div id="legend"></div>
+
+<script>
+  const TOKEN          = 'pk.eyJ1IjoibG90dXM4MyIsImEiOiJjbXdma21laGIwMnI1MnlxNHV6Z2VrZ2tmIn0.XZXZ3usSt_BH1oHlTg1Jzg';
+
+  // Title text shown at the top of the info panel
+  const TITLE          = 'Data centers by county (cartogram)';
+
+  // Path to the GeoJSON of data center POINTS. Relative path = file must sit in the same folder as this HTML.
+  // Note: fetch() of a local file generally requires running through a web server (not double-clicking the file).
+  const DC_FILE        = 'aterio_ghosts_plants.geojson';  // your data center points, same folder as this html file
+
+  // US county boundaries (polygons). Default is a public GeoJSON; or download it and use a local path.
+  const COUNTIES_FILE  = 'https://raw.githubusercontent.com/plotly/datasets/master/geojson-counties-fips.json';
+
+  // Name of the property in each data center feature holding its power capacity in megawatts
+  const CAPACITY_FIELD = 'SELECTED_POWER_CAPACITY_MW';
+
+  // Name of the property in each county feature holding the county's name
+  const NAME_FIELD     = 'NAME';               // county name property in the county file
+
+  // Shrinking rule: a county keeps its true size if its density (data centers per area) reaches the
+  // reference density; less dense counties shrink in proportion to sqrt(density / reference).
+
+  // Which percentile of county densities is used as the "reference" density.
+  // Counties at or above this density are drawn at full size.
+  const REF_PERCENTILE = 0.9;   // 0-1: lower = more counties shrink less, higher = more counties shrink more
+
+  // Floor on the scale factor, so even very sparse (or huge) counties don't shrink to an invisible dot
+  const MIN_SCALE      = 0.03;  // smallest allowed scale so tiny counties stay visible
+
+  const BREAKS = [1, 2, 4, 8, 16];                                   // data center count classes
+
+  // One color per class (light yellow -> dark red, a standard sequential ColorBrewer palette)
+  const COLORS = ['#ffffb2', '#fecc5c', '#fd8d3c', '#f03b20', '#bd0026'];
+
+  // Give Mapbox our token (must happen before creating the map)
+  mapboxgl.accessToken = TOKEN;
+
+  // Put the title text into the panel
+  document.getElementById('title').textContent = TITLE;
+
+  // Keep a handle on the status element so we can update progress messages later.
+  // (Note: this shadows the old global `window.status`, which is harmless here.)
+  const status = document.getElementById('status');
+
+  // Create the map
+  const map = new mapboxgl.Map({
+    container: 'map',                          // id of the div to render into
+    style: 'mapbox://styles/mapbox/light-v11', // muted light basemap so the colored counties stand out
+    center: [-96, 38.5],                       // [longitude, latitude], roughly the middle of the contiguous US
+    zoom: 3.6                                  // zoomed out far enough to see the whole country
+  });
+
+  // Add the zoom in/out buttons and compass in the top-right corner
+  map.addControl(new mapboxgl.NavigationControl());
+
+  // Scale every vertex of a geometry about a center point.
+  //   coords: a GeoJSON coordinates array (can be nested to any depth)
+  //   c:      [lng, lat] of the point to shrink toward (the county's center)
+  //   s:      scale factor (1 = unchanged, 0.5 = half size)
+  // Works recursively because GeoJSON nests differently by geometry type:
+  //   Polygon      -> [ring][point][x,y]
+  //   MultiPolygon -> [polygon][ring][point][x,y]
+  function scaleCoords(coords, c, s) {
+    return typeof coords[0] === 'number'
+      // Base case: coords is a single [lng, lat] pair.
+      // Move the point toward/away from the center: new = center + (old - center) * scale
+      ? [c[0] + (coords[0] - c[0]) * s, c[1] + (coords[1] - c[1]) * s]
+      // Otherwise coords is a list of deeper arrays: recurse into each one
+      : coords.map(part => scaleCoords(part, c, s));
+  }
+
+  // Quick check: is point p ([lng, lat]) inside bounding box b ([minX, minY, maxX, maxY])?
+  // Much cheaper than a full point-in-polygon test, so we use it to skip obvious non-matches.
+  function bboxContains(b, p) {
+    return p[0] >= b[0] && p[0] <= b[2] && p[1] >= b[1] && p[1] <= b[3];
+  }
+
+  map.on('load', async () => {
+
+    // Download both datasets in parallel (faster than one after the other),
+    // then parse each response as JSON. Destructuring gives us named results.
+    const [dc, counties] = await Promise.all([
+      fetch(DC_FILE).then(r => r.json()),
+      fetch(COUNTIES_FILE).then(r => r.json())
+    ]);
+
+    // Tell the user what's happening: the next step can take a few seconds
+    status.textContent = 'Counting data centers per county…';
+
+    // Pause for 30 ms so the browser gets a chance to repaint the status text
+    // before the heavy (blocking) computation below freezes the page.
+    await new Promise(r => setTimeout(r, 30));  // let the status text paint
+
+    const points = dc.features
+      // Keep only features that have a geometry and are single Points
+      // (skips any lines, polygons, or null-geometry records)
+      .filter(f => f.geometry && f.geometry.type === 'Point')
+      // Reshape each into a small object holding exactly what we need
+      .map(f => ({
+        c: f.geometry.coordinates,                // raw [lng, lat], used for the fast bbox check
+        pt: turf.point(f.geometry.coordinates),   // Turf point feature, needed by booleanPointInPolygon
+        mw: parseFloat(f.properties[CAPACITY_FIELD]) || 0  // capacity as a number; missing/invalid -> 0
+      }));
+
+    const hits = [];  // will hold only counties containing at least one data center
+
+    counties.features.forEach(f => {
+      const bb = turf.bbox(f);      // county's bounding box: [minX, minY, maxX, maxY]
+      let count = 0, mw = 0;        // running totals for this county
+
+      // Test every data center against this county
+      for (const p of points) {
+        // Two-stage test for speed: first the cheap bounding box check,
+        // and only if that passes, the expensive exact point-in-polygon check.
+        if (bboxContains(bb, p.c) && turf.booleanPointInPolygon(p.pt, f)) { count++; mw += p.mw; }
+      }
+
+      // Keep the county only if it has data centers; also store its area (in square meters)
+      // because we need it to compute density in the next step.
+      if (count > 0) hits.push({ f, count, mw, area: turf.area(f) });
+    });
+
+    // Density = data centers per unit area for each county, sorted from lowest to highest
+    const dens = hits.map(h => h.count / h.area).sort((a, b) => a - b);
+
+    // Pick the density at the chosen percentile as the reference.
+    // Math.min(...) guards against an index past the end of the array when the percentile is 1.
+    const ref = dens[Math.min(dens.length - 1, Math.floor(REF_PERCENTILE * dens.length))];
+
+    // Build the output features: each county polygon, shrunk about its own center
+    const features = hits.map(h => {
+      // Scale factor: sqrt(density / reference), clamped to the range [MIN_SCALE, 1].
+      //  - Counties at/above the reference density get 1 (true size, never enlarged).
+      //  - Why sqrt? Scaling a polygon's width and height by s changes its AREA by s².
+      //    So s = sqrt(density/ref) makes the drawn area = count / ref,
+      //    i.e. drawn area is proportional to the number of data centers.
+      const s = Math.max(MIN_SCALE, Math.min(1, Math.sqrt((h.count / h.area) / ref)));
+
+      // Shrink toward the county's center of mass so the smaller shape stays
+      // roughly where the real county is
+      const center = turf.centerOfMass(h.f).geometry.coordinates;
+
+      return {
+        type: 'Feature',
+        properties: {
+          // County name, falling back to the feature id, then to an empty string
+          name: h.f.properties[NAME_FIELD] ?? h.f.id ?? '',
+          count: h.count,          // number of data centers (drives the color)
+          mw: Math.round(h.mw),    // total capacity, rounded for display in the popup
+          scale: s                 // stored so the popup can say "drawn at X% of true size"
+        },
+        geometry: {
+          type: h.f.geometry.type, // keep the original type (Polygon or MultiPolygon)
+          coordinates: scaleCoords(h.f.geometry.coordinates, center, s)  // the shrunk shape
+        }
+      };
+    });
+
+    // Update the panel with a summary now that processing is done
+    status.textContent = `${points.length} data centers in ${features.length} counties. ` +
+      'Counties are shrunk by data center density; counties with none are hidden.';
+
+    // Register the shrunk counties as a GeoJSON data source
+    map.addSource('cartogram', { type: 'geojson', data: { type: 'FeatureCollection', features } });
+
+    // Build a Mapbox "step" expression to color counties by count.
+    // Format: ['step', input, defaultColor, threshold1, color1, threshold2, color2, ...]
+    // Start with the input (the 'count' property) and the first color as the default...
+    const fill = ['step', ['get', 'count'], COLORS[0]];
+    // ...then append a (threshold, color) pair for each remaining class
+    for (let i = 1; i < BREAKS.length; i++) fill.push(BREAKS[i], COLORS[i]);
+
+    // Filled polygons, colored by the expression above, slightly see-through so the basemap shows
+    map.addLayer({
+      id: 'cartogram-fill', type: 'fill', source: 'cartogram',
+      paint: { 'fill-color': fill, 'fill-opacity': 0.85 }
+    });
+
+    // Thin dark outline drawn on top so adjacent small counties stay distinguishable
+    map.addLayer({
+      id: 'cartogram-outline', type: 'line', source: 'cartogram',
+      paint: { 'line-color': '#333', 'line-width': 0.6 }
+    });
+
+    document.getElementById('legend').innerHTML = '<div><b>Data centers per county</b></div>' +
+      BREAKS.map((b, i) =>
+        // Row = color swatch + label. Label rules:
+        //  - Not the last class: show just the lower bound ("1") if the class holds one value,
+        //    or a range like "2–3" when the next break is more than one above this one
+        //  - Last class: show an open-ended label like "16+"
+        `<div><i style="background:${COLORS[i]}"></i>${b}${i < BREAKS.length - 1 ? (BREAKS[i + 1] - 1 > b ? '–' + (BREAKS[i + 1] - 1) : '') : '+'}</div>`
+      ).join('');  // join the array of row strings into one HTML string
+
+    
+    // Clicking a county opens a popup with its details
+    map.on('click', 'cartogram-fill', (e) => {
+      const p = e.features[0].properties;  // properties of the topmost clicked county
+      new mapboxgl.Popup()
+        .setLngLat(e.lngLat)               // anchor the popup where the user clicked
+        .setHTML(`
+        <h4>${p.name} County</h4>
+        <div>Data centers: <b>${p.count}</b></div>
+        <div>Total capacity: ${p.mw} MW</div>
+        <div>Drawn at ${(p.scale * 100).toFixed(0)}% of true size</div>`)  // scale shown as a whole-number percent
+        .addTo(map);
+    });
+
+    // Show a pointer (hand) cursor when hovering a county to signal it's clickable...
+    map.on('mouseenter', 'cartogram-fill', () => map.getCanvas().style.cursor = 'pointer');
+    // ...and restore the default cursor when the mouse leaves
+    map.on('mouseleave', 'cartogram-fill', () => map.getCanvas().style.cursor = '');
+  });
+</script>
+</body>
+</html>

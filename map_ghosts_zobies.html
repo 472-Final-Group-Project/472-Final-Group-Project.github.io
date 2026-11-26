@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Data centers map</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link href="https://api.mapbox.com/mapbox-gl-js/v3.7.0/mapbox-gl.css" rel="stylesheet">
+<script src="https://api.mapbox.com/mapbox-gl-js/v3.7.0/mapbox-gl.js"></script>
+<style>
+  html, body { margin: 0; height: 100%; font-family: system-ui, sans-serif; }
+  #map { position: absolute; inset: 0; }
+  #panel, #legend {
+    position: absolute; background: #fff; padding: 10px 12px; border-radius: 6px;
+    box-shadow: 0 1px 4px rgba(0,0,0,.3); font-size: 12px; line-height: 1.7;
+  }
+  #panel { top: 12px; left: 12px; }
+  #legend { bottom: 24px; right: 12px; max-height: 60vh; overflow-y: auto; }
+  #title { font-size: 16px; font-weight: 600; margin-bottom: 6px; }
+  #panel label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+  #legend h5 { margin: 6px 0 2px; font-size: 12px; }
+  #legend h5:first-child { margin-top: 0; }
+  #legend div { display: flex; align-items: center; gap: 6px; }
+  #legend img, #panel img { width: 16px; height: 16px; }
+  .mapboxgl-popup-content { font-size: 12px; line-height: 1.5; min-width: 220px; }
+  .mapboxgl-popup-content h4 { margin: 0 0 4px; font-size: 14px; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="panel">
+  <div id="title"></div>
+  <div id="toggles"></div>
+  <label style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-top:4px;border-top:1px solid #ddd;padding-top:4px">
+    <input type="checkbox" id="heat-toggle" checked> Heatmap (by capacity)
+  </label>
+</div>
+<div id="legend"></div>
+
+<script>
+  const TOKEN        = 'pk.eyJ1IjoibG90dXM4MyIsImEiOiJjbXdma21laGIwMnI1MnlxNHV6Z2VrZ2tmIn0.XZXZ3usSt_BH1oHlTg1Jzg';
+  const TITLE        = 'Data centers by power source';
+  const GEOJSON_FILE = 'aterio_ghosts_plants.geojson';   // same folder as this html file
+  const FLAG_FIELD   = 'flagMap';             // field that holds BTM / zombieFUEL / ghostFUEL / FUEL
+
+  // One color per fuel, used by all symbols. Fuels not listed here get a fallback color automatically.
+  const FUEL_COLORS = {
+    'COAL': '#4d4d4d',
+    'OIL': '#8c510a',
+    'GAS': '#e76f51',
+    'NUCLEAR': '#7b2cbf',
+    'HYDRO': '#1d70b8',
+    'BIOMASS': '#6a994e',
+    'WIND': '#4cc9f0',
+    'SOLAR': '#ffd60a',
+    'GEOTHERMAL': '#d62828',
+    'OTHER': '#bdb2a7'
+  };
+  const BTM_COLOR = '#e00000';
+
+  const FALLBACK = ['#f781bf', '#999999', '#a65628', '#17becf', '#bcbd22', '#ff7f0e'];
+
+  // category -> shape and label
+  const CATS = {
+    active: { shape: 'circle',   label: 'Fuel (circle)' },
+    zombie: { shape: 'triangle', label: 'Zombie + fuel (triangle)' },
+    ghost:  { shape: 'diamond',  label: 'Ghost + fuel (diamond)' },
+    btm:    { shape: 'star',     label: 'BTM (red star)' }
+  };
+
+  mapboxgl.accessToken = TOKEN;
+  document.getElementById('title').textContent = TITLE;
+
+  // "zombieCOAL" -> {cat:'zombie', fuel:'COAL'}, "BTM" -> {cat:'btm'}, "COAL" -> {cat:'active', fuel:'COAL'}
+  function parseFlag(v) {
+    const u = String(v ?? '').trim().toUpperCase();
+    if (!u || u === 'NA') return { cat: 'none' };
+    if (u.startsWith('BTM')) return { cat: 'btm', fuel: 'BTM' };
+    const m = u.match(/^(ZOMBIE|GHOST)[\s_\-:.]*(.*)$/);
+    if (m) return { cat: m[1].toLowerCase(), fuel: m[2] || 'UNKNOWN' };
+    return { cat: 'active', fuel: u };
+  }
+
+  const fuelColor = {};
+  function colorFor(fuel) {
+    if (fuel === 'BTM') return BTM_COLOR;
+    if (!fuelColor[fuel]) {
+      fuelColor[fuel] = FUEL_COLORS[fuel] ||
+        FALLBACK[(Object.keys(fuelColor).filter(k => !FUEL_COLORS[k]).length) % FALLBACK.length];
+    }
+    return fuelColor[fuel];
+  }
+
+  // Draw a symbol on a canvas; returns image data + a data URL for the legend
+  function makeIcon(shape, color) {
+    const s = 48, cx = 24, cy = 24, r = 16;
+    const c = document.createElement('canvas'); c.width = c.height = s;
+    const g = c.getContext('2d');
+    g.lineWidth = 3; g.strokeStyle = '#fff'; g.fillStyle = color; g.lineJoin = 'round';
+    g.beginPath();
+    if (shape === 'circle') g.arc(cx, cy, r - 1, 0, Math.PI * 2);
+    else if (shape === 'triangle') { g.moveTo(cx, cy - r); g.lineTo(cx + r, cy + r * 0.8); g.lineTo(cx - r, cy + r * 0.8); g.closePath(); }
+    else if (shape === 'diamond') { g.moveTo(cx, cy - r); g.lineTo(cx + r, cy); g.lineTo(cx, cy + r); g.lineTo(cx - r, cy); g.closePath(); }
+    else if (shape === 'star') {
+      for (let i = 0; i < 10; i++) {
+        const rad = i % 2 ? r * 0.45 : r + 3, a = -Math.PI / 2 + i * Math.PI / 5;
+        g[i ? 'lineTo' : 'moveTo'](cx + rad * Math.cos(a), cy + rad * Math.sin(a));
+      }
+      g.closePath();
+    }
+    g.stroke(); g.fill();
+    return { data: g.getImageData(0, 0, s, s), url: c.toDataURL() };
+  }
+
+  const map = new mapboxgl.Map({
+    container: 'map',
+    style: 'mapbox://styles/mapbox/light-v11',
+    center: [-98, 39],
+    zoom: 3
+  });
+  map.addControl(new mapboxgl.NavigationControl());
+
+  function getBounds(geojson) {
+    const b = new mapboxgl.LngLatBounds();
+    geojson.features.forEach(f => b.extend(f.geometry.coordinates));
+    return b;
+  }
+
+  map.on('load', async () => {
+    const raw = await fetch(GEOJSON_FILE).then(r => r.json());
+
+    // Classify each point and keep only those with a flag value
+    const features = [];
+    const fuelsPresent = new Set();
+    raw.features.forEach(f => {
+      const { cat, fuel } = parseFlag(f.properties[FLAG_FIELD]);
+      if (cat === 'none') return;
+      f.properties._cat = cat;
+      f.properties._fuel = fuel;
+      f.properties._icon = cat === 'btm' ? 'btm' : `${cat}-${fuel}`;
+      if (cat !== 'btm') fuelsPresent.add(fuel);
+      features.push(f);
+    });
+    const data = { type: 'FeatureCollection', features };
+
+    // Register one icon per (shape, fuel) combination in use
+    const legendUrls = {};
+    map.addImage('btm', makeIcon('star', BTM_COLOR).data, { pixelRatio: 2 });
+    legendUrls.btm = makeIcon('star', BTM_COLOR).url;
+    features.forEach(f => {
+      const id = f.properties._icon;
+      if (id === 'btm' || map.hasImage(id)) return;
+      const icon = makeIcon(CATS[f.properties._cat].shape, colorFor(f.properties._fuel));
+      map.addImage(id, icon.data, { pixelRatio: 2 });
+    });
+
+    // Heatmap of all data centers, weighted by capacity (MW)
+    const heatFeatures = raw.features.filter(f => f.geometry && f.geometry.coordinates).map(f => {
+      const mw = parseFloat(f.properties.SELECTED_POWER_CAPACITY_MW);
+      f.properties._mw = isNaN(mw) ? 0 : mw;
+      return f;
+    });
+    map.addSource('dc-heat', { type: 'geojson', data: { type: 'FeatureCollection', features: heatFeatures } });
+    map.addLayer({
+      id: 'dc-heat', type: 'heatmap', source: 'dc-heat',
+      paint: {
+        'heatmap-weight': ['interpolate', ['linear'], ['get', '_mw'], 0, 0.15, 500, 1],
+        'heatmap-intensity': ['interpolate', ['linear'], ['zoom'], 3, 0.6, 9, 2],
+        'heatmap-radius': ['interpolate', ['linear'], ['zoom'], 3, 14, 9, 45],
+        'heatmap-opacity': 0.65,
+        'heatmap-color': ['interpolate', ['linear'], ['heatmap-density'],
+          0, 'rgba(255,255,178,0)', 0.2, '#fed976', 0.4, '#feb24c',
+          0.6, '#fd8d3c', 0.8, '#f03b20', 1, '#bd0026']
+      }
+    });
+    document.getElementById('heat-toggle').addEventListener('change', (e) =>
+      map.setLayoutProperty('dc-heat', 'visibility', e.target.checked ? 'visible' : 'none'));
+
+    map.addSource('dc', { type: 'geojson', data });
+    map.addLayer({
+      id: 'dc-points', type: 'symbol', source: 'dc',
+      layout: {
+        'icon-image': ['get', '_icon'],
+        'icon-allow-overlap': true,
+        'icon-size': ['interpolate', ['linear'], ['zoom'], 3, 0.5, 8, 0.9],
+        'symbol-sort-key': ['match', ['get', '_cat'], 'btm', 3, 'ghost', 2, 'zombie', 1, 0]
+      }
+    });
+    if (features.length) map.fitBounds(getBounds(data), { padding: 60, animate: false, maxZoom: 7 });
+
+    // Category toggles (checkbox + symbol)
+    const toggles = document.getElementById('toggles');
+    const present = Object.keys(CATS).filter(c => features.some(f => f.properties._cat === c));
+    present.forEach(c => {
+      const url = makeIcon(CATS[c].shape, c === 'btm' ? BTM_COLOR : '#888').url;
+      const label = document.createElement('label');
+      label.innerHTML = `<input type="checkbox" data-cat="${c}" checked><img src="${url}">${CATS[c].label}`;
+      toggles.appendChild(label);
+    });
+    toggles.addEventListener('change', () => {
+      const on = [...toggles.querySelectorAll('input:checked')].map(i => i.dataset.cat);
+      map.setFilter('dc-points', ['in', ['get', '_cat'], ['literal', on]]);
+    });
+
+    // Legend: fuel colors
+    const fuels = [...fuelsPresent].sort();
+    document.getElementById('legend').innerHTML =
+      '<h5>Fuel</h5>' + fuels.map(f =>
+        `<div><img src="${makeIcon('circle', colorFor(f)).url}">${f}</div>`).join('') +
+      (present.includes('btm') ? `<h5>Behind-the-meter</h5><div><img src="${legendUrls.btm}">BTM</div>` : '') +
+      '<h5>Heatmap (capacity density)</h5>' +
+      '<div style="height:10px;width:100%;background:linear-gradient(to right,#fed976,#fd8d3c,#bd0026)"></div>' +
+      '<div style="justify-content:space-between"><span>low</span><span>high</span></div>';
+
+    // Popup
+    map.on('click', 'dc-points', (e) => {
+      const p = e.features[0].properties;
+      const row = (label, v) => (v && v !== 'NA') ? `<div>${label}: ${v}</div>` : '';
+      new mapboxgl.Popup().setLngLat(e.features[0].geometry.coordinates).setHTML(`
+        <h4>${p.DATA_CENTER_BUILDING_NAME ?? ''}</h4>
+        ${row('Campus', p.DATA_CENTER_CAMPUS_NAME)}
+        ${row('State', p.STATE_NAME)}
+        ${row('Stage', p.DATA_CENTER_STAGE)}
+        ${row('Capacity (MW)', p.SELECTED_POWER_CAPACITY_MW)}
+        ${row('Est. active date', p.ESTIMATED_ACTIVE_DATE_ATERIO)}
+        ${row('Execution likelihood', p.PROJECT_EXECUTION_LIKELIHOOD)}
+        ${row('Balancing authority', p.BAL_AUTH_ABBR)}
+        <hr>
+        <div><b>${FLAG_FIELD}: ${p[FLAG_FIELD]}</b></div>
+        ${row('Nearest plant', p.PNAME)}
+        ${row('Plant fuel', p.PLFUELCT)}
+        ${row('Plant capacity (MW)', p.NAMEPCAP)}
+      `).addTo(map);
+    });
+    map.on('mouseenter', 'dc-points', () => map.getCanvas().style.cursor = 'pointer');
+    map.on('mouseleave', 'dc-points', () => map.getCanvas().style.cursor = '');
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Choropleth map</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link href="https://api.mapbox.com/mapbox-gl-js/v3.7.0/mapbox-gl.css" rel="stylesheet">
+<script src="https://api.mapbox.com/mapbox-gl-js/v3.7.0/mapbox-gl.js"></script>
+<style>
+  html, body { margin: 0; height: 100%; font-family: system-ui, sans-serif; }
+  #map { position: absolute; inset: 0; }
+  #panel, #legend {
+    position: absolute; background: #fff; padding: 10px 12px; border-radius: 6px;
+    box-shadow: 0 1px 4px rgba(0,0,0,.3);
+  }
+  #panel { top: 12px; left: 12px; }
+  #title { font-size: 16px; font-weight: 600; margin-bottom: 8px; }
+  #fuel { font-size: 14px; padding: 4px; width: 100%; }
+  #legend { bottom: 24px; right: 12px; font-size: 12px; line-height: 1.6; }
+  #legend i { display: inline-block; width: 14px; height: 14px; margin-right: 6px; vertical-align: middle; }
+  .mapboxgl-popup-content { font-size: 12px; line-height: 1.5; min-width: 200px; }
+  .mapboxgl-popup-content h4 { margin: 0 0 4px; font-size: 14px; }
+  .mapboxgl-popup-content hr { border: 0; border-top: 1px solid #ddd; margin: 6px 0; }
+  .mapboxgl-popup-content .sel { font-weight: 700; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="panel">
+  <div id="title"></div>
+  <select id="fuel"></select>
+</div>
+<div id="legend"></div>
+
+<script>
+  const TOKEN        = 'pk.eyJ1IjoibG90dXM4MyIsImEiOiJjbXdma21laGIwMnI1MnlxNHV6Z2VrZ2tmIn0.XZXZ3usSt_BH1oHlTg1Jzg';
+  const TITLE        = 'Generation mix by eGRID subregion';
+  const GEOJSON_FILE = 'egrid2023_fuel_mix.geojson';    
+  const NAME_FIELD   = 'eGRID subregion name'; // popup heading
+  const CODE_FIELD   = 'Subregion';            
+  const CAPACITY_FIELD = 'Nameplate Capacity (MW)';
+  const GENERATION_FIELD = 'Net Generation (MWh)';
+
+  const FUEL_COLORS = {
+    'Coal': '#4d4d4d',
+    'Oil': '#8c510a',
+    'Gas': '#e76f51',
+    'Other Fossil': '#9e9e9e',
+    'Nuclear': '#7b2cbf',
+    'Hydro': '#1d70b8',
+    'Biomass': '#6a994e',
+    'Wind': '#4cc9f0',
+    'Solar': '#ffd60a',
+    'Geo- thermal': '#d62828',
+    'Other unknown/ purchased fuel': '#bdb2a7'
+  };
+  const RAMP = ['#ffffb2', '#fecc5c', '#fd8d3c', '#f03b20', '#bd0026']; // single-fuel map colors
+  // ========================
+
+  const FUELS = Object.keys(FUEL_COLORS);
+  const TOP = '__top__';
+
+  mapboxgl.accessToken = TOKEN;
+  document.getElementById('title').textContent = TITLE;
+
+  const select = document.getElementById('fuel');
+  select.add(new Option('Top fuel (all subregions)', TOP));
+  FUELS.forEach(f => select.add(new Option(f + ' share (%)', f)));
+  select.value = TOP;
+
+  const map = new mapboxgl.Map({
+    container: 'map',
+    style: 'mapbox://styles/mapbox/light-v11',
+    center: [-98, 39],
+    zoom: 3
+  });
+  map.addControl(new mapboxgl.NavigationControl());
+
+  // "14,3%" -> 14.3
+  function toNumber(v) {
+    let s = String(v).replace('%', '').trim();
+    if (s.includes(',')) s = s.replace(/\./g, '').replace(',', '.');
+    else if ((s.match(/\./g) || []).length > 1) s = s.replace(/\./g, '');
+    const n = parseFloat(s);
+    return isNaN(n) ? 0 : n;
+  }
+
+  function getBounds(geojson) {
+    const b = new mapboxgl.LngLatBounds();
+    const walk = (c) => typeof c[0] === 'number' ? b.extend(c) : c.forEach(walk);
+    geojson.features.forEach(f => walk(f.geometry.coordinates));
+    return b;
+  }
+
+  let data;
+
+  function update() {
+    const mode = select.value;
+    const legend = document.getElementById('legend');
+
+    if (mode === TOP) {
+      // Categorical map: color by dominant fuel
+      const fill = ['match', ['get', '_top']];
+      FUELS.forEach(f => fill.push(f, FUEL_COLORS[f]));
+      fill.push('#cccccc');
+      map.setPaintProperty('areas-fill', 'fill-color', fill);
+
+      const present = FUELS.filter(f => data.features.some(ft => ft.properties._top === f));
+      legend.innerHTML = '<div><b>Top fuel</b></div>' + present.map(f =>
+        `<div><i style="background:${FUEL_COLORS[f]}"></i>${f}</div>`).join('');
+      return;
+    }
+
+    // Graduated map for one fuel; class breaks adapt to that fuel's max value
+    data.features.forEach(f => { f.properties._value = toNumber(f.properties[mode]); });
+    map.getSource('areas').setData(data);
+
+    const max = Math.max(...data.features.map(f => f.properties._value));
+    const step = Math.max(1, Math.ceil(max / RAMP.length));
+    const breaks = RAMP.map((_, i) => i * step);
+
+    const fill = ['step', ['get', '_value'], RAMP[0]];
+    for (let i = 1; i < breaks.length; i++) fill.push(breaks[i], RAMP[i]);
+    map.setPaintProperty('areas-fill', 'fill-color', fill);
+
+    legend.innerHTML = `<div><b>${mode} (%)</b></div>` + breaks.map((b, i) =>
+      `<div><i style="background:${RAMP[i]}"></i>${b}${i < breaks.length - 1 ? '–' + breaks[i + 1] : '+'}</div>`
+    ).join('');
+  }
+
+  map.on('load', async () => {
+    data = await fetch(GEOJSON_FILE).then(r => r.json());
+
+    // Work out each subregion's top fuel once
+    data.features.forEach(f => {
+      let best = null, bestVal = -1;
+      FUELS.forEach(fuel => {
+        const v = toNumber(f.properties[fuel]);
+        if (v > bestVal) { bestVal = v; best = fuel; }
+      });
+      f.properties._top = best;
+      f.properties._topVal = bestVal;
+    });
+
+    map.addSource('areas', { type: 'geojson', data });
+    map.addLayer({
+      id: 'areas-fill', type: 'fill', source: 'areas',
+      paint: { 'fill-color': '#cccccc', 'fill-opacity': 0.75 }
+    });
+    map.addLayer({
+      id: 'areas-outline', type: 'line', source: 'areas',
+      paint: { 'line-color': '#444', 'line-width': 1 }
+    });
+
+    map.fitBounds(getBounds(data), { padding: 40, animate: false });
+    update();
+    select.addEventListener('change', update);
+
+    // Popup: name, code, top fuel, capacity, generation, then the full mix
+    map.on('click', 'areas-fill', (e) => {
+      const p = e.features[0].properties;
+      const rows = FUELS.map(f =>
+        `<div class="${f === select.value ? 'sel' : ''}">${f}: ${p[f]}</div>`).join('');
+      new mapboxgl.Popup().setLngLat(e.lngLat).setHTML(`
+        <h4>${p[NAME_FIELD] ?? ''}</h4>
+        <div>Code: ${p[CODE_FIELD] ?? '–'}</div>
+        <div>Top fuel: <b>${p._top}</b> (${p._topVal}%)</div>
+        <div>Nameplate capacity: ${p[CAPACITY_FIELD] ?? '–'} MW</div>
+        <div>Net generation: ${p[GENERATION_FIELD] ?? '–'} MWh</div>
+        <hr>${rows}`).addTo(map);
+    });
+    map.on('mouseenter', 'areas-fill', () => map.getCanvas().style.cursor = 'pointer');
+    map.on('mouseleave', 'areas-fill', () => map.getCanvas().style.cursor = '');
+  });
+</script>
+</body>
+</html>
